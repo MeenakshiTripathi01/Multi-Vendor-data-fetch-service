@@ -1,0 +1,161 @@
+# Starts the API, worker, both mock vendors, MongoDB, and RabbitMQ.
+# Host ports: API 3000, sync vendor 4001, async vendor 4002,
+# MongoDB 27017, RabbitMQ 5672, management UI 15672.
+
+x-app-env: &app-env
+  MONGO_URL: mongodb://mongo:27017/vendor_fetch?replicaSet=rs0
+  MONGO_DB: vendor_fetch
+  MONGO_CONNECT_RETRIES: "30"
+  RABBITMQ_URL: amqp://vendor:vendor@rabbitmq:5672
+  RABBIT_CONNECT_RETRIES: "30"
+  JOBS_QUEUE: jobs
+  WEBHOOK_SECRET: dev-webhook-secret-change-me
+  SYNC_VENDOR_URL: http://sync-vendor:4001
+  ASYNC_VENDOR_URL: http://async-vendor:4002
+  ASYNC_WEBHOOK_URL: http://api:3000/vendor-webhook/async
+  VENDOR_RATE_LIMIT: "2"
+  VENDOR_RATE_WINDOW_MS: "1000"
+  RATE_LIMIT_MAX_WAIT_MS: "20000"
+  WORKER_MAX_ATTEMPTS: "5"
+  WORKER_PREFETCH: "1"
+  WORKER_LEASE_MS: "15000"
+  SYNC_VENDOR_LATENCY_MS: "0"
+  SYNC_VENDOR_TIMEOUT_MS: "2000"
+  ASYNC_VENDOR_DELAY_MS: "400"
+  WEBHOOK_MAX_RETRIES: "5"
+  WEBHOOK_RETRY_BASE_MS: "200"
+  OUTBOX_INTERVAL_MS: "500"
+  LOG_LEVEL: info
+  PII_FIELDS: email,phone,ssn
+
+services:
+  mongo:
+    image: mongo:7
+    hostname: mongo
+    # Same policy as the app services. Docker's default "no" leaves this
+    # container exited after an engine restart, which removes the "mongo" DNS name.
+    restart: unless-stopped
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "${MONGO_HOST_PORT:-27017}:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  mongo-init:
+    image: mongo:7
+    depends_on:
+      mongo:
+        condition: service_healthy
+    volumes:
+      - ./docker/mongo-init.js:/mongo-init.js:ro
+    entrypoint: ["mongosh", "--host", "mongo:27017", "--file", "/mongo-init.js"]
+    restart: on-failure
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    # Same policy as the app services. Docker's default "no" leaves this
+    # container exited after an engine restart.
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: vendor
+      RABBITMQ_DEFAULT_PASS: vendor
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  sync-vendor:
+    build: .
+    image: vendor-fetch:local
+    restart: unless-stopped
+    command: ["node", "vendor-mocks/sync-vendor.js"]
+    environment:
+      <<: *app-env
+      SYNC_VENDOR_PORT: "4001"
+    ports:
+      - "4001:4001"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4001/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  async-vendor:
+    build: .
+    image: vendor-fetch:local
+    restart: unless-stopped
+    command: ["node", "vendor-mocks/async-vendor.js"]
+    environment:
+      <<: *app-env
+      ASYNC_VENDOR_PORT: "4002"
+    ports:
+      - "4002:4002"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4002/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  api:
+    build: .
+    image: vendor-fetch:local
+    restart: unless-stopped
+    command: ["node", "src/server.js"]
+    environment:
+      <<: *app-env
+      PORT: "3000"
+    ports:
+      - "${API_HOST_PORT:-3000}:3000"
+    depends_on:
+      mongo:
+        condition: service_healthy
+      mongo-init:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  worker:
+    build: .
+    image: vendor-fetch:local
+    restart: unless-stopped
+    command: ["node", "worker/worker.js"]
+    environment:
+      <<: *app-env
+    depends_on:
+      mongo:
+        condition: service_healthy
+      mongo-init:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+      sync-vendor:
+        condition: service_healthy
+      async-vendor:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+volumes:
+  mongo_data:
+  rabbitmq_data:
