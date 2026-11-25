@@ -11,7 +11,7 @@ docker run --rm -v "<project>:/work" -w /work grafana/k6 run \
   load-test/load-test.js
 ```
 
-The API was published on host port **3100**, not 3000, because another local stack already owned ports 3000 and 27017. Container ports were unchanged. The scenario was the default: **200 virtual users for 60 seconds**, sync vendor, one `sleep(1)` per iteration. k6 exited **0**. Thresholds in the script passed. Raw output is `load-test/results/summary.json` and `load-test/results/k6-stdout.txt`.
+The API was published on host port **3100**, not 3000, because another local stack already owned ports 3000 and 27017. Container ports were unchanged. The scenario was the default: **200 virtual users for 60 seconds**, sync vendor, one `sleep(1)` per iteration. k6 exited **0**. Thresholds in the script passed. The saved raw summary is `load-test/results/summary.json`. The console transcript was not saved.
 
 Other Docker containers were already running on the same machine, so this is not an idle-machine benchmark.
 

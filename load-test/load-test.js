@@ -3,8 +3,8 @@ import { check, sleep } from 'k6';
 import { Counter, Trend } from 'k6/metrics';
 
 // Graded shape: 200 virtual users for 60 seconds. Override with VUS and DURATION.
-// VENDOR=sync is the saved run. VENDOR=async uses the same traffic shape against
-// the asynchronous vendor; that configuration has not been run as a 200 VU / 60s test.
+// The sync historical run is saved in load-test/results/summary.json.
+// The async historical run is saved in load-test/results/async-summary.json.
 //
 // These counters do not mean the same thing:
 // - http_req_failed: the HTTP call itself failed. Zero does not mean jobs finished.
@@ -109,8 +109,6 @@ export default function () {
 }
 
 export function handleSummary(data) {
-  // Default path is the historical sync run. Set SUMMARY_PATH for any other run
-  // so that file is not replaced.
   const summaryPath = __ENV.SUMMARY_PATH || 'load-test/results/summary.json';
   return {
     [summaryPath]: JSON.stringify(data, null, 2),

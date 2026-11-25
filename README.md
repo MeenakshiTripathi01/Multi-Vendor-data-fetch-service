@@ -1,156 +1,139 @@
-# Multi-vendor data fetch
+# Multi-Vendor Data Fetch Service
 
-Clients submit a JSON payload and receive a `request_id` immediately. A worker calls either a synchronous mock vendor or an asynchronous mock vendor. Both paths store one cleaned result in MongoDB. `GET /jobs/:request_id` is the only status API.
+A Node.js service that accepts jobs through one API and processes them with a RabbitMQ worker. It has exactly two mock vendors: `sync`, which returns the result in the vendor HTTP call, and `async`, which accepts the job and later posts an HMAC-SHA256 webhook. Both share a MongoDB rolling-window limit of two calls per vendor per second.
 
-```
-Client
-  |  POST /jobs                         GET /jobs/:request_id
-  v
-Express API ---- MongoDB transaction: job + outbox row
-  |                     |
-  | 202 {request_id}    | outbox publisher (confirmed publish)
-  |                     v
-  |                  RabbitMQ durable queue
-  |                     |
-  |                     v
-  |                  Worker (manual ack, shared rate limit)
-  |                    |                         \
-  |                    v                          v
-  |             Sync vendor HTTP            Async vendor HTTP
-  |             result in the response      202 + vendor_job_id
-  |                    |                          |
-  |                    |                          | signed callback
-  |                    v                          v
-  |                 clean result            POST /vendor-webhook/async
-  |                    \                          /
-  |                     v                        v
-  |                        MongoDB jobs collection
+## Architecture
+
+```text
+Client -> Express API -> MongoDB (jobs + outbox) -> RabbitMQ -> Worker
+                                                         +-> sync vendor -> HTTP result -> MongoDB
+                                                         \-> async vendor -> webhook -> MongoDB
 ```
 
-## Prerequisites
+## Stack
 
-- Node.js 20 or newer
-- Docker with Docker Compose
-- k6 is optional. The load-test command below uses the `grafana/k6` image.
+Node.js 20 or newer, Express, a MongoDB replica set, RabbitMQ, Docker Compose, k6, and the Node.js built-in test runner.
 
-## Setup
+## Quick start
 
-```bash
+Prerequisites: Docker Desktop. Node.js and npm are needed for the tests and the completion snapshot, not for the containers. k6 is optional; the recorded runs used the `grafana/k6` image.
+
+Copy `.env.example` to `.env` only when you run a process on the host. Those values are local defaults. Compose injects its own settings and does not read that file.
+
+This workspace publishes the API on host port 3100 and MongoDB on 27018 because 3000 and 27017 were already in use:
+
+```powershell
+git clone https://github.com/MeenakshiTripathi01/Multi-Vendor-data-fetch-service.git
+cd Multi-Vendor-data-fetch-service
+$env:API_HOST_PORT = "3100"
+$env:MONGO_HOST_PORT = "27018"
 docker compose up --build
 ```
 
-MongoDB and RabbitMQ start inside Compose. Nothing else needs to be installed locally for the stack itself. Copy `.env.example` to `.env` only if you run a process on the host. The example values are local development defaults, not production secrets.
+The API process listens on container port 3000. Compose publishes that as host port 3000 when `API_HOST_PORT` is unset, and MongoDB as 27017 when `MONGO_HOST_PORT` is unset. Containers still call each other by service name. The examples below use host port 3100.
 
-Stop the stack with `docker compose down`. Add `-v` to delete MongoDB and RabbitMQ data volumes.
+RabbitMQ is published on 5672. Its management UI is `http://localhost:15672`. The Compose user is `vendor` / `vendor`. The image's `guest` user cannot be used from another container. Sync and async mocks are on host ports 4001 and 4002.
 
-Compose publishes the API on host port 3000 when `API_HOST_PORT` is unset, and MongoDB on 27017 when `MONGO_HOST_PORT` is unset. If either port is already taken, set those variables to free ports. Containers still talk to each other on the internal ports. This workspace started with `API_HOST_PORT=3100` and `MONGO_HOST_PORT=27018`, so the examples below use those host ports.
-
-RabbitMQ uses the user `vendor` / `vendor` because the image's default `guest` user refuses connections from other containers. The management UI is `http://localhost:15672`.
+`docker compose down` stops the stack and keeps the volumes. Adding `-v` deletes the MongoDB and RabbitMQ data.
 
 ## API
 
 | Call | Result |
 | --- | --- |
-| `POST /jobs` | `202 {"request_id":"<uuid>"}` |
-| `GET /jobs/:request_id` while pending or processing | `200 {"status":"processing"}` |
+| `POST /jobs` | `202 {"request_id":"<uuid>"}` after the job and outbox row are stored |
+| `GET /jobs/:request_id` while `pending` or `processing` | `200 {"status":"processing"}` |
 | `GET /jobs/:request_id` when complete | `200 {"status":"complete","result":{...}}` |
-| `GET /jobs/:request_id` when failed | `200 {"status":"failed","error_code":"<safe code>"}` |
+| `GET /jobs/:request_id` when failed | `200 {"status":"failed","error_code":"<code>"}` |
 | Unknown id | `404 {"error":"job_not_found"}` |
-| Malformed JSON or a bad id | `400` |
+| Malformed JSON | `400 {"error":"invalid_json"}` |
+| Unknown vendor | `400 {"error":"invalid_vendor"}` |
+| Id that is not a UUID v4 | `400 {"error":"invalid_request_id"}` |
+| `GET /health` when MongoDB answers | `200 {"status":"ok"}` |
+| `GET /health` when MongoDB does not answer | `503 {"status":"unavailable"}` |
 
-Public failure codes: `vendor_timeout`, `vendor_unavailable`, `invalid_vendor_response`, `rate_limited`, `max_retries_exceeded`, `vendor_rejected`, `queue_unavailable`.
+Public `error_code` values are `vendor_timeout`, `vendor_unavailable`, `invalid_vendor_response`, `rate_limited`, `max_retries_exceeded`, `vendor_rejected`, and `queue_unavailable`. Any other stored code is returned as `vendor_unavailable`.
 
-`vendor` is `sync` (default) or `async`. A query parameter overrides the JSON field. `scenario` on the JSON body drives the mocks: `success`, `rate_limit`, `server_error`, `timeout`, `malformed`, and `fail` (async callback failure).
+`vendor` is `sync` or `async`. If it is omitted, the job is `sync`. A `?vendor=` query parameter overrides the JSON field. Other JSON fields are stored and forwarded. `scenario` selects a mock behaviour and defaults to `success`.
 
-### Examples
+| `scenario` | Where | What the mock does |
+| --- | --- | --- |
+| `success` | both | Sync returns the sample record. Async accepts, then webhooks that record. |
+| `rate_limit` | both | `429` and `Retry-After` |
+| `server_error` | both | `500` |
+| `malformed` | both | HTTP 200 with plain text, which the worker treats as an invalid vendor response |
+| `timeout` | sync only | Sleeps, then returns JSON. The worker HTTP timeout is 2000 ms, so this path times out. |
+| `fail` | async only | Accepts, then webhooks `status: "failed"` with `vendor_rejected` |
 
-These four calls use `http://localhost:3100` because that is the published API port in this workspace. When `API_HOST_PORT` is unset, Compose publishes the API on port 3000, and the same paths belong on `http://localhost:3000`.
-
-```bash
-curl -s -X POST http://localhost:3100/jobs \
-  -H 'content-type: application/json' \
-  -d '{"vendor":"sync","customer":"Ada"}'
-
-curl -s -X POST http://localhost:3100/jobs \
-  -H 'content-type: application/json' \
-  -d '{"vendor":"async","customer":"Grace"}'
-
-curl -s http://localhost:3100/jobs/PASTE_REQUEST_ID_HERE
-
-curl -s -i http://localhost:3100/jobs/not-a-uuid
+```powershell
+curl.exe -X POST http://localhost:3100/jobs -H "Content-Type: application/json" -d '{"vendor":"sync","customer":"Alice"}'
 ```
+
+```powershell
+curl.exe -X POST http://localhost:3100/jobs -H "Content-Type: application/json" -d '{"vendor":"async","customer":"Alice"}'
+```
+
+```powershell
+curl.exe http://localhost:3100/jobs/YOUR_REQUEST_ID
+```
+
+```powershell
+curl.exe http://localhost:3100/health
+```
+
+When Compose is started without `API_HOST_PORT`, use port 3000 in those URLs.
+
+## Design
+
+`POST /jobs` inserts the job and an outbox row in one MongoDB transaction on the replica set, then returns. It does not call a vendor. The publisher confirms the persistent RabbitMQ message and then marks the outbox row published. A crash after the confirm and before that flag can deliver the same job twice. The worker treats the duplicate as the same job. A sweeper recreates a missing outbox row for an old pending job. After `OUTBOX_MAX_ATTEMPTS` (10), the job is marked `failed` with `queue_unavailable`.
+
+Queues are durable. The worker uses manual acknowledgements and prefetch 1. A sync job is acknowledged only after the cleaned result is saved. An async job is acknowledged after `vendor_job_id` is saved, which leaves the job `processing` until the webhook. Permanent failures and exhausted retries are saved, then dead-lettered on `jobs.dlq`. Nothing consumes that queue. Transient failures are acknowledged only after a delayed retry message is published. The delay queues are 1, 2, 4, 8, and 16 seconds. `Retry-After` can select a longer slot. Attempts stop at `WORKER_MAX_ATTEMPTS` (5).
+
+A claim sets `lock_token` and a 15-second lease. The worker's result and failure writes match that token, so a late write cannot replace a newer terminal state. If the worker dies before acknowledgement, RabbitMQ redelivers. A job already `complete` or `failed`, or an async job that already has `vendor_job_id`, is acknowledged with no second vendor call. If the crash happened before that write, the vendor can be called again.
+
+Each vendor gets at most 2 grants in any rolling 1000 ms. Grants live on one MongoDB document per vendor and commit with a compare-and-swap on `version`, so every worker shares the window. The mocks also enforce a window inside their own process and can return `429`. The worker waits for a grant before calling. Two submissions per second is the vendor cap, not the API's accept rate. `POST /jobs` only writes MongoDB, so a load test can accept far more jobs than the worker can finish. Extra workers share the same window: `docker compose up --build --scale worker=2`. That shape was not load-tested.
+
+`POST /vendor-webhook/async` requires `X-Vendor-Signature: sha256=<HMAC-SHA256 of the raw body>` using `WEBHOOK_SECRET`. A bad signature is `401` and does not change the job. The first `complete` or `failed` write wins. A repeat delivery returns `200 {"status":"duplicate"}`. A persistence error returns `500`, and the mock retries `429` and `5xx`. It does not retry other `4xx`.
+
+Vendor results are copied, strings are trimmed, and `email`, `phone`, and `ssn` at any depth become `[REDACTED]`. The vendor object is not mutated. Free text, custom field names, unlabeled strings, and the stored request payload are not scrubbed. `GET` returns the cleaned result, not the original request.
 
 ## Tests
 
-```bash
-npm test
-npm run test:integration
-npm run test:all
+```powershell
+npm.cmd install
+npm.cmd test
+npm.cmd run test:integration
+npm.cmd run test:all
 ```
 
-Unit tests do not need Docker. Integration tests start an in-memory MongoDB replica set and the mock vendors. They do not call a real external vendor. The first integration run downloads a MongoDB binary.
+`npm test` runs the unit tests for cleaning, vendor selection, retry timing, webhook signatures, and the mock windows. It does not need Docker. `npm run test:integration` starts an in-memory MongoDB replica set and the two mock apps, and calls the worker function through a fake RabbitMQ channel. It does not call a real external vendor or the Compose broker. The first integration run downloads a MongoDB binary.
 
-## Load test
+## Load testing
 
-Run these from the project directory with the stack already up. Compose publishes the API on port 3000 unless `API_HOST_PORT` is set. `docker compose ps` on this workspace shows `3100->3000`, and the saved run used `3100`.
+Run these from the project directory with the stack already up. The script defaults to 200 virtual users for 60 seconds, mixes creates and status polls, uses `http://localhost:3000`, and writes `load-test/results/summary.json`. The recorded runs used host port 3100.
 
-PowerShell, synchronous vendor (the saved 200 VU / 60s run used this vendor):
+Sync, which writes the historical sync summary:
 
 ```powershell
-# Change 3100 to 3000 when Compose was started without API_HOST_PORT.
-$apiPort = "3100"
-docker run --rm -v "${PWD}:/work" -w /work grafana/k6 run -e "BASE_URL=http://host.docker.internal:$apiPort" -e "VENDOR=sync" load-test/load-test.js
+docker run --rm -v "${PWD}:/work" -w /work grafana/k6 run -e BASE_URL=http://host.docker.internal:3100 -e VENDOR=sync load-test/load-test.js
 ```
 
-`${PWD}` is the project directory. The k6 container reaches the host through `host.docker.internal`.
-
-The same script targets the asynchronous vendor when `VENDOR=async`. That does not change the sync default. The saved async run is 200 virtual users for 60 seconds, and its raw output is `load-test/results/async-summary.json`:
+Async, which writes a separate file:
 
 ```powershell
-# Same host port as the sync command. SUMMARY_PATH keeps the saved sync file.
-$apiPort = "3100"
-docker run --rm -v "${PWD}:/work" -w /work grafana/k6 run -e "BASE_URL=http://host.docker.internal:$apiPort" -e "VENDOR=async" -e "SUMMARY_PATH=load-test/results/async-summary.json" load-test/load-test.js
+docker run --rm -v "${PWD}:/work" -w /work grafana/k6 run -e BASE_URL=http://host.docker.internal:3100 -e VENDOR=async -e SUMMARY_PATH=load-test/results/async-summary.json load-test/load-test.js
 ```
 
-`SUMMARY_PATH` keeps that run from replacing `load-test/results/summary.json`.
+Running either command again replaces that summary file. The saved sync file has 11,317 HTTP requests and an HTTP failure rate of 0. The saved async file has 11,669 HTTP requests and an HTTP failure rate of 0. Those counts are HTTP calls, not finished jobs. The sync file has 4,439 `POST` checks that returned 202 and 6,878 `GET` checks that returned 200. The async file has `jobs_created` 4,469, which means the API accepted 4,469 jobs. `status_complete` is 67 in the sync file and 74 in the async file: those are polls whose body said `complete`, not distinct completed jobs. The sync file has no `e2e_observed_ms` samples. The async file has 30, and each sample includes `sleep(1)`. Notes are in `load-test/analysis.md`. The k6 console transcript was not saved.
 
-k6 numbers are not job-completion numbers:
-
-| What you see | What it means |
-| --- | --- |
-| `http_req_failed` near 0 | The HTTP call returned. The vendor may not have run. |
-| `jobs_created` and HTTP 202 | The API accepted a job. This is job creation, not completion. |
-| `post_job_duration`, `get_job_duration` | Latency of that one HTTP call. |
-| `status_processing`, `status_complete`, `status_failed` | How many polls saw that body. One finished job can be counted more than once. Jobs that nobody polled are missing. |
-| `e2e_observed_ms` | Time from this virtual user's HTTP 202 until a later GET by that same user returns `complete`. The sample includes `sleep(1)` and any time spent polling other ids. A job still queued, or one this user never polls again, is absent. The saved sync `summary.json` has no `e2e_observed_ms` samples. The async file has 30. |
-| Queue depth | Not in the k6 file. The snapshot script reads RabbitMQ at the moment it runs. That depth is the current backlog, not the 4,112 messages recorded after the saved run. |
-
-`status_complete` is not a completion count. The snapshot field `jobs_by_status.complete` is how many `complete` documents are stored when the script runs, including jobs created outside k6. `stored_processing_latency_ms` is `completed_at` minus `created_at` on those stored documents. It is not `e2e_observed_ms`, and it does not reconstruct the saved run.
-
-The snapshot needs the Compose stack already up, `npm install` so Node can load `mongodb`, and the host ports below. It connects to MongoDB with `directConnection=true` because the replica set advertises the Docker hostname `mongo`, which the host cannot resolve. RabbitMQ's management API must be reachable at `http://127.0.0.1:15672` with the Compose user `vendor` / `vendor`. The script's own defaults are MongoDB port 27017 and management port 15672. This workspace publishes MongoDB on 27018:
+With the stack up and dependencies installed, the current database and queue can be read without creating jobs:
 
 ```powershell
 $env:MONGO_HOST_PORT = "27018"
 node load-test/completion-snapshot.js
 ```
 
-See `load-test/analysis.md` for the saved sync run and the 13 November async run. The async backlog later drained to 0 pending, 0 processing, 0 failed, and 0 queue messages. Those 4,469 load-test jobs are stored as `complete`, along with 6 older completed jobs.
+The script uses `directConnection=true` because the replica set advertises the hostname `mongo`. Its RabbitMQ default is `http://127.0.0.1:15672` as user `vendor`. A snapshot describes the database at that moment. It does not reconstruct either saved k6 run.
 
-## Design
+## Trade-offs
 
-- **Outbox.** `POST /jobs` inserts the job and an outbox row in one MongoDB transaction, then returns 202. A publisher loop confirms the RabbitMQ publish and marks the row published. That is not a distributed transaction. A crash after the broker confirm and before the published flag can deliver the same job twice. The worker treats that as one job. If the outbox row is missing, a sweeper recreates it for pending jobs. If the broker still cannot accept the message after repeated tries, the job is marked `failed` with `queue_unavailable` instead of being dropped.
-- **Manual acks.** The worker acks a sync job only after the cleaned result is saved, and acks an async job only after `vendor_job_id` is saved. The async acknowledgement does not complete the job. Exhausted or permanent failures are written to MongoDB and then dead-lettered (`jobs.dlq`). Transient failures are acked only after a delayed retry message is published. Retry delays are 1s, 2s, 4s, 8s, and 16s, and `Retry-After` can push the delay higher. Attempts stop at `WORKER_MAX_ATTEMPTS` (default 5).
-- **Crash after the vendor responds.** If the worker dies before ack, RabbitMQ redelivers. A terminal job, or an async job that already has `vendor_job_id`, is acked with no second vendor call. If the crash was before that write, the vendor may be called again. Updates include the lock token and the current status, so a late write cannot replace a newer terminal result.
-- **Rate limit.** Each vendor allows 2 grants in any rolling 1000ms window. Grants are stored on one MongoDB document per vendor and committed with a compare-and-swap on `version`, so every worker replica shares the same window. The mock vendors enforce the same window inside their own process and answer `429` with `Retry-After`. The worker waits for a free slot before calling, and still honors a vendor `429`.
-- **Throughput.** Two submissions per second is not the same as two completed jobs per second of API capacity. `POST /jobs` only writes MongoDB. Sync jobs then wait for a vendor slot, so completion stays near 2 jobs/second/vendor. Async jobs also wait for `ASYNC_VENDOR_DELAY_MS` after the submission slot. A load test can accept far more jobs than it can finish. Most `GET` responses during that test will say `processing`.
-- **Cleaning.** Vendor results are copied, string fields are trimmed, and `email`, `phone`, and `ssn` (any depth, any casing) become `[REDACTED]`. The original object is not changed. Free text, custom field names, and the stored request payload are not scrubbed. Logs record request ids and status codes, not payloads or vendor bodies.
-- **Webhook.** `POST /vendor-webhook/async` requires `X-Vendor-Signature: sha256=<HMAC-SHA256 of the raw body>` using `WEBHOOK_SECRET`. Invalid signatures are `401`. The first terminal state wins. A repeat delivery returns `200` and does not overwrite the result. A persistence error returns `500` so the mock vendor retries with backoff. `4xx` other than `429` is not retried.
-- **One worker, prefetch 1.** That is the default so a single process does not hold a pile of unacked messages. Extra replicas still share the MongoDB limiter: `docker compose up --build --scale worker=2`.
-
-## Known limitations
-
-- Posting the same logical request twice creates two jobs. There is no client idempotency key.
-- The async mock remembers `request_id` only in memory. A vendor restart can create a second vendor job.
-- Rate-limit timestamps use each host's clock. Large clock skew can nudge the shared window.
-- Request payloads are stored as submitted so the worker can forward them. `GET` does not return them.
-- Load-test numbers are in `load-test/analysis.md`. HTTP 202 is acceptance. `status_complete` counts polls, not finished jobs. `e2e_observed_ms` includes client sleep and misses jobs the same virtual user does not see complete. Queue depth comes only from `completion-snapshot.js` and only for the database that exists at that moment. The 29 October run is synchronous. The 13 November run is asynchronous, and its backlog later reached 0 with all 4,469 load-test jobs stored as `complete`. A multi-worker load test was not executed.
+Processing is at-least-once, not exactly-once. Clients poll for job status. There is no client idempotency key, so the same logical request posted twice creates two jobs. The public job API has no authentication. The async mock remembers `request_id` only in memory, so a vendor restart can accept the same id again. Rate-limit timestamps use each process clock. The dead-letter queue has no consumer.
